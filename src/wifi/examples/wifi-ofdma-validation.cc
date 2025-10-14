@@ -165,24 +165,57 @@ public:
     void ResumeComms();
   };
 
+
+  // Orchestrate one TB sensing exchange (stand-in sequence)
+  void DoTbSensingExchange(const SensingExchange& ex);
+
+  // (Optional) change per-exchange gaps
+  Time m_sensSifs { MicroSeconds(16) };          // SIFS-ish spacing
+  Time m_sensGap  { MicroSeconds(84) };          // small guard/gap
+  uint16_t m_sensingReportPort { 9001 };         // AP UDP port to receive sensing reports
+
+  // Dedicated sink for sensing reports at the AP (Track A)
+  ApplicationContainer m_sensingSinkApp;
+
+  // ---- Minimal “bf-like” report builder (Track A stub) -----------------------
+  class SensingReportBuilder
+  {
+  public:
+    // bwCode: 0=20,1=40,2=80,3=160,4=320 (bf Table 9-129j)
+    static Ptr<Packet> Build(uint8_t sessionId,
+                            uint8_t exchangeId,
+                            uint8_t bwCode,
+                            uint8_t nTxChains,
+                            uint8_t nRxChains,
+                            uint16_t staId12b,     // 12-bit AID/USID (TB reporting field)
+                            uint8_t rssiDbm);      // toy RSSI per-chain (collapsed)
+  };
+
+
+  // UDP report sender (STA side)
+  void SendSensingReport(Ptr<Node> staNode,
+                        Ipv4Address apAddr,
+                        uint16_t port,
+                        uint8_t sessionId,
+                        uint8_t exchangeId,
+                        uint16_t staAidOrUsid);
+
+
   
   class SensingReportBuilder {
   public:
-    static Ptr<Packet> Build(uint8_t sessionId, uint8_t exchangeId,
-                            Mac48Address tx, Mac48Address rx,
-                            uint8_t bwCode /* 0:20 1:40 2:80 3:160 4:320 */) {
-      Buffer::DataBuffer buf;
-      // Container Length (2B) placeholder -> fill later
-      // Segmentation Control (5B): pack session/exchange, IDs, flags
-      // Presence+Control bitmap (1B): TimestampPresent=1
-      // BW (3 bits), Ntx/Nrx (3+3 bits), grouping(1b), Rx_OP_Gain_Type(2b), CSIvariation(4b=15),
-      // PuncturingPattern(16b)=0, Timestamp(4B)
-      // MeasuredCSI: put RSSI per chain + tiny CSI subset for now
-      // ...
-      Ptr<Packet> p = Create<Packet>(/*buf*/);
-      return p;
-    }
-  };
+      static Ptr<Packet> Build(uint8_t sessionId,
+                              uint8_t exchangeId,
+                              uint8_t bwCode,
+                              uint8_t nTxChains,
+                              uint8_t nRxChains,
+                              uint16_t staId12b,
+                              uint8_t rssiDbm) {
+        // Build a dummy packet for sensing report (stub)
+        Ptr<Packet> p = Create<Packet>(16); // arbitrary size for stub
+        return p;
+      }
+    };
 
 
 
@@ -1006,6 +1039,16 @@ WifiOfdmaExample::Setup (void)
   // Try to minimize the chances of collision among flows
   Config::SetDefault ("ns3::FqCoDelQueueDisc::Perturbation", UintegerValue (9973));
   Config::SetDefault ("ns3::FqCoDelQueueDisc::EnableSetAssociativeHash", BooleanValue (true));
+
+  // --- Sensing report UDP sink on AP[0] (Track A plumbing) ---
+  {
+    PacketSinkHelper sensSinkHelper("ns3::UdpSocketFactory",
+                                    InetSocketAddress(Ipv4Address::GetAny(), m_sensingReportPort));
+    m_sensingSinkApp = sensSinkHelper.Install(m_apNodes.Get(0));
+    m_sensingSinkApp.Start(Seconds(0.0));
+    m_sensingSinkApp.Stop(Seconds(m_warmup + m_simulationTime + 100));
+  }
+
 
   if (m_tcpSegmentSize != 0)
     {
@@ -2158,36 +2201,208 @@ void WifiOfdmaExample::StartSensing()
   });
 }
 
-void WifiOfdmaExample::StartSensing()
+
+void
+WifiOfdmaExample::StartSensing()
 {
   NS_LOG_FUNCTION(this);
-  Time now = Simulator::Now();
 
+  const Time now = Simulator::Now();
+
+  // Keep the periodic SAW loop going
   if (now + m_sawFrequency < Seconds(m_simulationTime))
   {
     Simulator::Schedule(m_sawFrequency, &WifiOfdmaExample::StartSensing, this);
   }
 
-  NS_LOG_INFO("Sensing Availability Window started at " << now.GetSeconds() << "s");
+  NS_LOG_INFO("SAW start @ " << now.GetSeconds() << " s  (dur="
+                             << m_sawDuration.GetMilliSeconds() << " ms)");
 
-  // Schedule sensing exchanges during SAW
-  for (uint16_t staId = 0; staId < m_nHeStations; ++staId)
+  // Track A: temporarily quiet data traffic during SAW
+  PauseCommsForWindow(now, m_sawDuration);
+
+  // Compute a sessionId and schedule per-STA TB exchanges (staggered)
+  const uint8_t sessionId = static_cast<uint8_t>((now.GetMilliSeconds() / 1000) % 8);
+  uint8_t exchangeId = 0;
+
+  for (uint16_t staIdx = 0; staIdx < m_nHeStations; ++staIdx)
   {
-    Ptr<Node> apNode = m_apNodes.Get(0);
-    Ptr<Node> staNode = m_staNodes.Get(staId);
+    // 1-based STA ID (matches how flows are labeled in the example)
+    const uint16_t staId = static_cast<uint16_t>(staIdx + 1);
 
-    Time offset = MilliSeconds(10 * staId); // staggered sensing
-    if (offset < m_sawDuration)
+    // stagger inside SAW so we can eyeball timing in logs
+    const Time t0 = MilliSeconds(2 + staIdx * 3);
+
+    SensingExchange ex;
+    ex.sessionId  = sessionId;
+    ex.exchangeId = exchangeId++;
+    ex.token      = static_cast<uint8_t>((now.GetMicroSeconds() + staIdx) & 0x7);
+    ex.responders = { staId };
+    ex.startTs    = now + t0;
+
+    if (t0 < m_sawDuration - MilliSeconds(2))
     {
-      Simulator::Schedule(offset, &WifiOfdmaExample::SendSensingTrigger, this, apNode, staNode, staId);
+      Simulator::Schedule(t0, &WifiOfdmaExample::DoTbSensingExchange, this, ex);
     }
   }
 
-  // Optionally log end of SAW
+  // Bookend log
   Simulator::Schedule(m_sawDuration, [now]() {
     NS_LOG_INFO("Sensing Availability Window ended at " << (now + MilliSeconds(100)).GetSeconds() << "s");
   });
 }
+
+void
+WifiOfdmaExample::DoTbSensingExchange(const SensingExchange& ex)
+{
+  NS_LOG_INFO("TB Sensing Xchg  (sess=" << unsigned(ex.sessionId)
+              << ", exch=" << unsigned(ex.exchangeId) << ")"
+              << " with STA_" << ex.responders.front()
+              << " @ " << Simulator::Now().GetMicroSeconds() << " us");
+
+  // Resolve AP/STA pointers and AP IP
+  Ptr<Node> apNode  = m_apNodes.Get(0);
+  Ptr<Node> staNode = m_staNodes.Get(ex.responders.front() - 1);
+  Ipv4Address apIp  = m_apInterfaces.GetAddress(0);
+
+  // Timeline (microsecond-scale). We just log & schedule stand-ins.
+
+  // t0: AP -> Sensing Polling Trigger (stand-in)
+  NS_LOG_INFO("  AP  -> [Sensing Polling TF] (stand-in)");
+  // (here you could mark a TF as 'sensing' in your scheduler if desired)
+
+  // t0 + SIFS + small gap: STA -> UL TB NDP (stand-in as zero-payload UL TB PPDU)
+  Simulator::Schedule(m_sensSifs + m_sensGap, [staNode]() {
+    NS_LOG_INFO("  STA -> [UL TB NDP] (stand-in, zero payload)");
+    // No real PHY change yet; just a trace marker.
+  });
+
+  // Next: AP -> Sensing NDP Announcement (SNDP-A) (stand-in Action/QoS frame)
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(120), [this]() {
+    NS_LOG_INFO("  AP  -> [Sensing NDP Announcement] (stand-in)");
+  });
+
+  // Next: AP -> SR2SI Sounding Trigger (stand-in) then AP -> DL NDP
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(220), [this]() {
+    NS_LOG_INFO("  AP  -> [SR2SI Sounding TF] (stand-in)");
+  });
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(320), [this]() {
+    NS_LOG_INFO("  AP  -> [DL NDP] (stand-in)");
+  });
+
+  // Next: AP -> Sensing Reporting Trigger (stand-in)
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(420), [this]() {
+    NS_LOG_INFO("  AP  -> [Sensing Reporting TF] (stand-in)");
+  });
+
+  // Finally: STA -> Sensing Measurement Report (UDP payload with compact bf-like container)
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(540), [=]() {
+    const uint8_t bwCode   = (m_channelWidth == 20 ? 0 :
+                             (m_channelWidth == 40 ? 1 :
+                             (m_channelWidth == 80 ? 2 :
+                             (m_channelWidth == 160 ? 3 : 4))));
+    const uint8_t nTx = 1, nRx = 1;       // Track A: simple single-chain stub
+    const uint16_t aid12 = static_cast<uint16_t>(ex.responders.front() & 0x0FFF);
+
+    SendSensingReport(staNode, apIp, m_sensingReportPort,
+                      ex.sessionId, ex.exchangeId, aid12);
+  });
+}
+
+#include "ns3/udp-socket-factory.h"
+#include "ns3/inet-socket-address.h"
+
+void
+WifiOfdmaExample::SendSensingReport(Ptr<Node> staNode,
+                                    Ipv4Address apAddr,
+                                    uint16_t port,
+                                    uint8_t sessionId,
+                                    uint8_t exchangeId,
+                                    uint16_t staAidOrUsid)
+{
+  // Build a tiny "bf-like" report payload (Track A compact stub)
+  const uint8_t bwCode = (m_channelWidth == 20 ? 0 :
+                         (m_channelWidth == 40 ? 1 :
+                         (m_channelWidth == 80 ? 2 :
+                         (m_channelWidth == 160 ? 3 : 4))));
+  const uint8_t nTx = 1, nRx = 1;
+  const int8_t  rssiDbm = -50; // toy value for plumbing
+
+  Ptr<Packet> pkt = SensingReportBuilder::Build(sessionId, exchangeId, bwCode,
+                                                nTx, nRx, staAidOrUsid,
+                                                static_cast<uint8_t>(-rssiDbm));
+  Ptr<Packet> pkt = SensingReportBuilder::Build(sessionId, exchangeId, bwCode,
+                                                nTx, nRx, staAidOrUsid,
+                                                static_cast<uint8_t>(rssiDbm));
+  
+  Ptr<Socket> sock = Socket::CreateSocket(staNode, UdpSocketFactory::GetTypeId());
+  sock->Connect(InetSocketAddress(apAddr, port));
+  sock->Send(pkt);
+  sock->Close();
+
+  NS_LOG_INFO("  STA -> [Sensing Report]  (sess=" << unsigned(sessionId)
+              << ", exch=" << unsigned(exchangeId)
+              << ", size=" << pkt->GetSize() << "B)");
+}
+
+  Ptr<Packet>
+  WifiOfdmaExample::SensingReportBuilder::Build(uint8_t sessionId,
+                                              uint8_t exchangeId,
+                                              uint8_t bwCode,
+                                              uint8_t nTxChains,
+                                              uint8_t nRxChains,
+                                              uint16_t staId12b,
+                                              uint8_t rssiDbmUnsigned)
+  {
+    std::vector<uint8_t> bytes;
+    bytes.reserve(32);
+
+    // Placeholder container length (2B) -> fill at end
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+
+    // "Segmentation control" (5B compact): [sess(3) | exch(6) | first(1)=1 | invalid(1)=0 | reserved]
+    // For Track A we pack as: B0: sess(3) + exch0..4
+    //                         B1: exch5 + flags(7) (bit6=first, bit5=invalid=0)
+    // The remaining 3 bytes reserved to keep 5B footprint similar to bf.
+    const uint8_t b0 = static_cast<uint8_t>(((sessionId & 0x07) << 5) | ((exchangeId & 0x3F) >> 1));
+    const uint8_t b1 = static_cast<uint8_t>(((exchangeId & 0x01) << 7) | (1 << 6)); // first=1, invalid=0
+    bytes.push_back(b0);
+    bytes.push_back(b1);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+    bytes.push_back(0x00);
+
+    // Presence+control bitmap (1B): bit0=TimestampPresent=1 (Track A), others 0
+    bytes.push_back(0x01);
+
+    // BW (1B), nTx (1B), nRx (1B)
+    bytes.push_back(bwCode & 0x07);
+    bytes.push_back(nTxChains & 0x07);
+    bytes.push_back(nRxChains & 0x07);
+
+    // 32-bit timestamp (lower TSF or Now in us)
+    const uint32_t ts = static_cast<uint32_t>(Simulator::Now().GetMicroSeconds() & 0xFFFFFFFFu);
+    bytes.push_back(static_cast<uint8_t>((ts >> 24) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>((ts >> 16) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>((ts >> 8) & 0xFF));
+    bytes.push_back(static_cast<uint8_t>(ts & 0xFF));
+
+    // 12-bit STA ID (AID/USID) -> pack into 2 bytes (0..4095)
+    const uint16_t sid = (staId12b & 0x0FFF);
+    bytes.push_back(static_cast<uint8_t>((sid >> 8) & 0x0F));  // upper 4 bits
+    bytes.push_back(static_cast<uint8_t>(sid & 0xFF));        // lower 8 bits
+
+    // One RSSI byte (unsigned; convert to signed at the sink if needed)
+    bytes.push_back(rssiDbmUnsigned);
+
+    // Now fill length (including the 2 length bytes)
+    const uint16_t totalLen = static_cast<uint16_t>(bytes.size());
+    bytes[0] = static_cast<uint8_t>((totalLen >> 8) & 0xFF);
+    bytes[1] = static_cast<uint8_t>(totalLen & 0xFF);
+
+    return Create<Packet>(bytes.data(), bytes.size());
+  };
 
 void WifiOfdmaExample::SendSensingTrigger(Ptr<Node> apNode, Ptr<Node> staNode, uint16_t staId)
 {
