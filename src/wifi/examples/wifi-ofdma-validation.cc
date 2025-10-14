@@ -144,6 +144,47 @@ public:
      */
     std::unordered_map<uint64_t, Time> m_inFlightPackets;
   };
+  
+  struct SensingExchange {
+    uint8_t sessionId{0};   // 0..7 (bf)
+    uint8_t exchangeId{0};  // 0..63
+    uint8_t token{0};       // for partial TSF matching
+    std::vector<uint16_t> responders; // STA IDs in this exchange
+    Time startTs;           // for logging
+  };
+
+  class SensingManager {
+  public:
+    void StartWindow(Time winStart, Time dur);
+    void ScheduleTbExchange(const SensingExchange& ex);
+    void OnUlNdpRx(Mac48Address sta);
+    void OnDlNdpRx(Mac48Address ap);
+    void OnReportRx(Mac48Address sta);
+    // hooks to pause/resume data traffic (Track A only)
+    void PauseCommsDuringSAW(Time start, Time dur);
+    void ResumeComms();
+  };
+
+  
+  class SensingReportBuilder {
+  public:
+    static Ptr<Packet> Build(uint8_t sessionId, uint8_t exchangeId,
+                            Mac48Address tx, Mac48Address rx,
+                            uint8_t bwCode /* 0:20 1:40 2:80 3:160 4:320 */) {
+      Buffer::DataBuffer buf;
+      // Container Length (2B) placeholder -> fill later
+      // Segmentation Control (5B): pack session/exchange, IDs, flags
+      // Presence+Control bitmap (1B): TimestampPresent=1
+      // BW (3 bits), Ntx/Nrx (3+3 bits), grouping(1b), Rx_OP_Gain_Type(2b), CSIvariation(4b=15),
+      // PuncturingPattern(16b)=0, Timestamp(4B)
+      // MeasuredCSI: put RSSI per chain + tiny CSI subset for now
+      // ...
+      Ptr<Packet> p = Create<Packet>(/*buf*/);
+      return p;
+    }
+  };
+
+
 
   /**
    * Create an example instance.
@@ -194,6 +235,27 @@ public:
    * Start generating traffic.
    */
   void StartTraffic (void);
+
+  /**
+   * Start sensing the medium.
+   */
+  void StartSensing (void);
+  /**
+   * Send a sensing trigger frame.
+   */
+  void SendSensingTrigger (Ptr<Node> apNode, Ptr<Node> staNode, uint16_t staId);
+  /**
+   * Receive a sensing trigger frame.
+   */
+  void ReceiveSensingTrigger (Ptr<Node> staNode, Mac48Address apMac, Mac48Address staMac, uint16_t staId);
+  /**
+   * AP received NDP from STA
+   */
+  void ReceiveNdpFromSta (Mac48Address apMac, Mac48Address staMac, uint16_t staId);
+  /**
+   * Gate the data traffic briefly during sensing
+   */
+  void PauseCommsForWindow(Time start, Time dur);
   /**
    * Start collecting statistics.
    */
@@ -416,6 +478,9 @@ private:
   uint64_t m_countOfNullResponsesToLastTf {0}; // count of QoS Null frames sent in response to the last TF
   TriggerFrameType m_lastTfType;   // type of the last Trigger Frame sent (Basic or Bsrp)
 
+  Time m_sawFrequency = {Seconds(1)}; // Time between SAW activations
+  Time m_sawDuration = {MilliSeconds(100)};  // Duration of each SAW
+
   // Metrics that can be measured (sender side) for each (AP,STA) pair (DL) or
   // (STA,AP) pair (UL) and for each Access Category
   struct PairwisePerAcStats
@@ -632,6 +697,8 @@ WifiOfdmaExample::Config (int argc, char *argv[])
   cmd.AddValue ("maxTxopDuration", "TXOP duration for BE in microseconds", m_beTxopLimit);
   cmd.AddValue ("scheduler", "Scheduler to employ [rr, my]", m_scheduler);
   cmd.AddValue ("simulationTime", "Time to simulate", m_simulationTime);
+  cmd.AddValue ("sawFrequency", "Frequency of sensing availability window", m_sawFrequency);
+  cmd.AddValue ("sawDuration", "Duration of sensing availability window", m_sawDuration);
   cmd.Parse (argc, argv);
 
   // if (m_muBeCwMin == 0)
@@ -2055,7 +2122,125 @@ WifiOfdmaExample::StartTraffic (void)
     }
 
   Simulator::Schedule (Seconds (m_warmup), &WifiOfdmaExample::StartStatistics, this);
+
+  Simulator::Schedule(Seconds(1.0), &WifiOfdmaExample::StartSensing, this);
 }
+
+void WifiOfdmaExample::StartSensing()
+{
+  Time now = Simulator::Now();
+  if (now + m_sawFrequency < Seconds(m_simulationTime)) {
+    Simulator::Schedule(m_sawFrequency, &WifiOfdmaExample::StartSensing, this);
+  }
+
+  // 1) Pause comms in Track A (remove in Track B)
+  PauseCommsForWindow(now, m_sawDuration);
+
+  NS_LOG_INFO("SAW start @ " << now.GetSeconds() << "s");
+  uint8_t sessionId = (now.GetMilliSeconds()/1000) % 8;
+  uint8_t exch = 0;
+
+  // Stagger per-STA sensing within this SAW
+  for (uint16_t staIdx = 0; staIdx < m_nHeStations; ++staIdx) {
+    Time t0 = MilliSeconds(2 + staIdx * 3); // small staggering
+    SensingExchange ex;
+    ex.sessionId = sessionId;
+    ex.exchangeId = exch++;
+    ex.responders = {static_cast<uint16_t>(staIdx+1)};
+    ex.startTs = now + t0;
+
+    Simulator::Schedule(t0, &WifiOfdmaExample::DoTbSensingExchange,
+                        this, ex /* + AP/STA pointers if needed */);
+  }
+
+  Simulator::Schedule(m_sawDuration, [now]() {
+    NS_LOG_INFO("SAW end @ " << (now + MilliSeconds(100)).GetSeconds() << "s");
+  });
+}
+
+void WifiOfdmaExample::StartSensing()
+{
+  NS_LOG_FUNCTION(this);
+  Time now = Simulator::Now();
+
+  if (now + m_sawFrequency < Seconds(m_simulationTime))
+  {
+    Simulator::Schedule(m_sawFrequency, &WifiOfdmaExample::StartSensing, this);
+  }
+
+  NS_LOG_INFO("Sensing Availability Window started at " << now.GetSeconds() << "s");
+
+  // Schedule sensing exchanges during SAW
+  for (uint16_t staId = 0; staId < m_nHeStations; ++staId)
+  {
+    Ptr<Node> apNode = m_apNodes.Get(0);
+    Ptr<Node> staNode = m_staNodes.Get(staId);
+
+    Time offset = MilliSeconds(10 * staId); // staggered sensing
+    if (offset < m_sawDuration)
+    {
+      Simulator::Schedule(offset, &WifiOfdmaExample::SendSensingTrigger, this, apNode, staNode, staId);
+    }
+  }
+
+  // Optionally log end of SAW
+  Simulator::Schedule(m_sawDuration, [now]() {
+    NS_LOG_INFO("Sensing Availability Window ended at " << (now + MilliSeconds(100)).GetSeconds() << "s");
+  });
+}
+
+void WifiOfdmaExample::SendSensingTrigger(Ptr<Node> apNode, Ptr<Node> staNode, uint16_t staId)
+{
+  Mac48Address apMac = Mac48Address::ConvertFrom(apNode->GetDevice(0)->GetAddress());
+  Mac48Address staMac = Mac48Address::ConvertFrom(staNode->GetDevice(0)->GetAddress());
+
+  NS_LOG_INFO("AP [" << apMac << "] sending Sensing Polling Trigger to STA [" << staMac << "]");
+
+  Simulator::Schedule(MicroSeconds(100), &WifiOfdmaExample::ReceiveSensingTrigger, this, staNode, apMac, staMac, staId);
+}
+
+
+void WifiOfdmaExample::ReceiveSensingTrigger(Ptr<Node> staNode, Mac48Address apMac, Mac48Address staMac, uint16_t staId)
+{
+  NS_LOG_INFO("STA [" << staMac << "] received Sensing Polling Trigger from AP [" << apMac << "] and responds with NDP");
+
+  Simulator::Schedule(MicroSeconds(100), &WifiOfdmaExample::ReceiveNdpFromSta, this, apMac, staMac, staId);
+}
+
+void WifiOfdmaExample::ReceiveNdpFromSta(Mac48Address apMac, Mac48Address staMac, uint16_t staId)
+{
+  NS_LOG_INFO("AP [" << apMac << "] received NDP from STA [" << staMac << "] — Sensing exchange complete");
+}
+
+
+void WifiOfdmaExample::PauseCommsForWindow(Time start, Time dur) {
+  // Lambda to pause communications
+  auto pause = [this, dur]() {
+    for (auto &app : m_clientApps) {
+      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
+      if (!onoff) continue;
+      onoff->SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+      std::stringstream ss; ss << "ns3::ConstantRandomVariable[Constant=" << dur.GetSeconds() + 1e-3 << "]";
+      onoff->SetAttribute("OffTime", StringValue(ss.str()));
+    }
+  };
+  // Lambda to resume communications
+  auto resume = [this]() {
+    for (auto &app : m_clientApps) {
+      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
+      if (!onoff) continue;
+      std::stringstream on; on << "ns3::ConstantRandomVariable[Constant=" << (m_warmup + m_simulationTime) << "]";
+      onoff->SetAttribute("OnTime", StringValue(on.str()));
+      onoff->SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+    }
+  };
+  Simulator::Schedule(start - Simulator::Now(), pause);
+  Simulator::Schedule(start + dur - Simulator::Now(), resume);
+}
+
+
+
+
 
 void
 WifiOfdmaExample::StartStatistics (void)
