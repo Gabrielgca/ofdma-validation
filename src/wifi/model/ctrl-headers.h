@@ -566,7 +566,8 @@ enum TriggerFrameType : uint8_t
   BSRP_TRIGGER = 4,        // Buffer Status Report Poll
   GCR_MU_BAR_TRIGGER = 5,  // Groupcast with Retries MU-BAR
   BQRP_TRIGGER = 6,        // Bandwidth Query Report Poll
-  NFRP_TRIGGER = 7         // NDP Feedback Report Poll
+  NFRP_TRIGGER = 7,         // NDP Feedback Report Poll
+  SENSING_TRIGGER = 8     // Trigger Frame for Sensing
 };
 
 
@@ -1005,6 +1006,13 @@ public:
    *         false otherwise
    */
   bool IsNfrp (void) const;
+  /**
+   * Check if this is a Trigger Frame for Sensing.
+   *
+   * \return true if this is a Trigger Frame for Sensing,
+   *         false otherwise
+   */
+  bool IsSensing (void) const;
   /**
    * Set the UL Length subfield of the Common Info field.
    *

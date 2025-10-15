@@ -1807,6 +1807,12 @@ CtrlTriggerHeader::IsNfrp (void) const
   return (m_triggerType == NFRP_TRIGGER);
 }
 
+bool
+CtrlTriggerHeader::IsSensing (void) const
+{
+  return (m_triggerType == SENSING_TRIGGER);
+}
+
 void
 CtrlTriggerHeader::SetUlLength (uint16_t len)
 {
