@@ -70,7 +70,9 @@ NS_LOG_COMPONENT_DEFINE ("WifiOfdmaExample");
  * number of overlapping BSSes made of stations of a given technology (11n,
  * 11ac or 11ax).
  *
+ * export NS_LOG=WifiOfdmaExample=level_info
  * Usage: ./waf --run "wifi-ofdma [options]"
+ * ./waf --run "src/wifi/examples/wifi-ofdma-validation --nStations=20 --legacyFraction=0 --frameSize=1000 --channelWidth=20 --Na=5 --cwMin=15 --mcs=5 --dl=su --ul=su --maxTxopDuration=4800 --ackSeqType=AGGR-MU-BAR --scheduler=rr" > mylog.txt 2>&1
  *
  * The available options can be listed by typing:
  *
@@ -146,7 +148,7 @@ public:
   };
   
   struct SensingExchange {
-    uint8_t sessionId{0};   // 0..7 (bf)
+  uint8_t sessionId{0};   // 0..7 (bf)
     uint8_t exchangeId{0};  // 0..63
     uint8_t token{0};       // for partial TSF matching
     std::vector<uint16_t> responders; // STA IDs in this exchange
@@ -169,13 +171,18 @@ public:
   // Orchestrate one TB sensing exchange (stand-in sequence)
   void DoTbSensingExchange(const SensingExchange& ex);
 
+  void StaUlTbNdp(Ptr<Node> staNode);
+  void ApSensingNdpAnnouncement();
+  void ApSr2SiSoundingTf();
+  void ApDlNdp();
+  void ApSensingReportingTf();
+
+
   // (Optional) change per-exchange gaps
   Time m_sensSifs { MicroSeconds(16) };          // SIFS-ish spacing
   Time m_sensGap  { MicroSeconds(84) };          // small guard/gap
   uint16_t m_sensingReportPort { 9001 };         // AP UDP port to receive sensing reports
 
-  // Dedicated sink for sensing reports at the AP (Track A)
-  ApplicationContainer m_sensingSinkApp;
 
   // ---- Minimal “bf-like” report builder (Track A stub) -----------------------
   class SensingReportBuilder
@@ -199,24 +206,6 @@ public:
                         uint8_t sessionId,
                         uint8_t exchangeId,
                         uint16_t staAidOrUsid);
-
-
-  
-  class SensingReportBuilder {
-  public:
-      static Ptr<Packet> Build(uint8_t sessionId,
-                              uint8_t exchangeId,
-                              uint8_t bwCode,
-                              uint8_t nTxChains,
-                              uint8_t nRxChains,
-                              uint16_t staId12b,
-                              uint8_t rssiDbm) {
-        // Build a dummy packet for sensing report (stub)
-        Ptr<Packet> p = Create<Packet>(16); // arbitrary size for stub
-        return p;
-      }
-    };
-
 
 
   /**
@@ -1040,16 +1029,6 @@ WifiOfdmaExample::Setup (void)
   Config::SetDefault ("ns3::FqCoDelQueueDisc::Perturbation", UintegerValue (9973));
   Config::SetDefault ("ns3::FqCoDelQueueDisc::EnableSetAssociativeHash", BooleanValue (true));
 
-  // --- Sensing report UDP sink on AP[0] (Track A plumbing) ---
-  {
-    PacketSinkHelper sensSinkHelper("ns3::UdpSocketFactory",
-                                    InetSocketAddress(Ipv4Address::GetAny(), m_sensingReportPort));
-    m_sensingSinkApp = sensSinkHelper.Install(m_apNodes.Get(0));
-    m_sensingSinkApp.Start(Seconds(0.0));
-    m_sensingSinkApp.Stop(Seconds(m_warmup + m_simulationTime + 100));
-  }
-
-
   if (m_tcpSegmentSize != 0)
     {
       Config::SetDefault ("ns3::TcpSocket::SegmentSize", UintegerValue (m_tcpSegmentSize));
@@ -1161,7 +1140,7 @@ WifiOfdmaExample::Setup (void)
               schedulerString = "Bellalta";
             }
           mac.SetMultiUserScheduler ("ns3::RrMultiUserScheduler",
-                                     "NStations", UintegerValue (m_maxNRus),
+                                     "NStations", UintegerValue (m_maxNRus), //CHECK: should it be maxNRus or nStations?
                                      "ForceDlOfdma", BooleanValue (m_forceDlOfdma),
                                      "EnableUlOfdma", BooleanValue (m_enableUlOfdma),
                                      "EnableTxopSharing", BooleanValue (m_enableTxopSharing),
@@ -1345,6 +1324,9 @@ WifiOfdmaExample::Setup (void)
     }
 
   // Setting mobility model
+  // CHECK: currently, all stations are uniformly distributed in a disk of radius m_radius
+  // centered at the position of the AP of the BSS they belong to
+  // CHECK: m_radius is currently 0, i.e., all nodes are positioned at the AP location
   for (uint16_t bss = 0; bss < m_nObss + 1; bss++)
     {
       MobilityHelper mobility;
@@ -1863,6 +1845,8 @@ WifiOfdmaExample::PrintResults (std::ostream &os)
   os << std::endl << std::endl;
 }
 
+// Start the association procedure for the current station
+//TODO: Start Sensing Polling phase
 void
 WifiOfdmaExample::StartAssociation (void)
 {
@@ -2169,37 +2153,37 @@ WifiOfdmaExample::StartTraffic (void)
   Simulator::Schedule(Seconds(1.0), &WifiOfdmaExample::StartSensing, this);
 }
 
-void WifiOfdmaExample::StartSensing()
-{
-  Time now = Simulator::Now();
-  if (now + m_sawFrequency < Seconds(m_simulationTime)) {
-    Simulator::Schedule(m_sawFrequency, &WifiOfdmaExample::StartSensing, this);
-  }
+// void WifiOfdmaExample::StartSensing()
+// {
+//   Time now = Simulator::Now();
+//   if (now + m_sawFrequency < Seconds(m_simulationTime)) {
+//     // Simulator::Schedule(m_sawFrequency, &WifiOfdmaExample::StartSensing, this);
+//   }
 
-  // 1) Pause comms in Track A (remove in Track B)
-  PauseCommsForWindow(now, m_sawDuration);
+//   // 1) Pause comms in Track A (remove in Track B)
+//   PauseCommsForWindow(now, m_sawDuration);
 
-  NS_LOG_INFO("SAW start @ " << now.GetSeconds() << "s");
-  uint8_t sessionId = (now.GetMilliSeconds()/1000) % 8;
-  uint8_t exch = 0;
+//   NS_LOG_INFO("SAW start @ " << now.GetSeconds() << "s");
+//   uint8_t sessionId = (now.GetMilliSeconds()/1000) % 8;
+//   uint8_t exch = 0;
 
-  // Stagger per-STA sensing within this SAW
-  for (uint16_t staIdx = 0; staIdx < m_nHeStations; ++staIdx) {
-    Time t0 = MilliSeconds(2 + staIdx * 3); // small staggering
-    SensingExchange ex;
-    ex.sessionId = sessionId;
-    ex.exchangeId = exch++;
-    ex.responders = {static_cast<uint16_t>(staIdx+1)};
-    ex.startTs = now + t0;
+//   // Stagger per-STA sensing within this SAW
+//   for (uint16_t staIdx = 0; staIdx < m_nHeStations; ++staIdx) {
+//     Time t0 = MilliSeconds(2 + staIdx * 3); // small staggering
+//     SensingExchange ex;
+//     ex.sessionId = sessionId;
+//     ex.exchangeId = exch++;
+//     ex.responders = {static_cast<uint16_t>(staIdx+1)};
+//     ex.startTs = now + t0;
 
-    Simulator::Schedule(t0, &WifiOfdmaExample::DoTbSensingExchange,
-                        this, ex /* + AP/STA pointers if needed */);
-  }
+//     // Simulator::Schedule(t0, &WifiOfdmaExample::DoTbSensingExchange,
+//                         // this, ex /* + AP/STA pointers if needed */);
+//   }
 
-  Simulator::Schedule(m_sawDuration, [now]() {
-    NS_LOG_INFO("SAW end @ " << (now + MilliSeconds(100)).GetSeconds() << "s");
-  });
-}
+//   // Simulator::Schedule(m_sawDuration, [now]() {
+//   //   NS_LOG_INFO("SAW end @ " << (now + MilliSeconds(100)).GetSeconds() << "s");
+//   // });
+// }
 
 
 void
@@ -2247,9 +2231,9 @@ WifiOfdmaExample::StartSensing()
   }
 
   // Bookend log
-  Simulator::Schedule(m_sawDuration, [now]() {
-    NS_LOG_INFO("Sensing Availability Window ended at " << (now + MilliSeconds(100)).GetSeconds() << "s");
-  });
+  // Simulator::Schedule(m_sawDuration, [now]() {
+  //   NS_LOG_INFO("Sensing Availability Window ended at " << (now + MilliSeconds(100)).GetSeconds() << "s");
+  // });
 }
 
 void
@@ -2260,54 +2244,66 @@ WifiOfdmaExample::DoTbSensingExchange(const SensingExchange& ex)
               << " with STA_" << ex.responders.front()
               << " @ " << Simulator::Now().GetMicroSeconds() << " us");
 
-  // Resolve AP/STA pointers and AP IP
   Ptr<Node> apNode  = m_apNodes.Get(0);
   Ptr<Node> staNode = m_staNodes.Get(ex.responders.front() - 1);
   Ipv4Address apIp  = m_apInterfaces.GetAddress(0);
 
-  // Timeline (microsecond-scale). We just log & schedule stand-ins.
-
-  // t0: AP -> Sensing Polling Trigger (stand-in)
   NS_LOG_INFO("  AP  -> [Sensing Polling TF] (stand-in)");
-  // (here you could mark a TF as 'sensing' in your scheduler if desired)
 
-  // t0 + SIFS + small gap: STA -> UL TB NDP (stand-in as zero-payload UL TB PPDU)
-  Simulator::Schedule(m_sensSifs + m_sensGap, [staNode]() {
-    NS_LOG_INFO("  STA -> [UL TB NDP] (stand-in, zero payload)");
-    // No real PHY change yet; just a trace marker.
-  });
+  // t0 + SIFS + small gap: STA -> UL TB NDP
+  Simulator::Schedule(m_sensSifs + m_sensGap,
+                      &WifiOfdmaExample::StaUlTbNdp, this, staNode);
 
-  // Next: AP -> Sensing NDP Announcement (SNDP-A) (stand-in Action/QoS frame)
-  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(120), [this]() {
-    NS_LOG_INFO("  AP  -> [Sensing NDP Announcement] (stand-in)");
-  });
+  // t0 + ... +120us: AP -> Sensing NDP Announcement
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(120),
+                      &WifiOfdmaExample::ApSensingNdpAnnouncement, this);
 
-  // Next: AP -> SR2SI Sounding Trigger (stand-in) then AP -> DL NDP
-  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(220), [this]() {
-    NS_LOG_INFO("  AP  -> [SR2SI Sounding TF] (stand-in)");
-  });
-  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(320), [this]() {
-    NS_LOG_INFO("  AP  -> [DL NDP] (stand-in)");
-  });
+  // t0 + ... +220us: AP -> SR2SI Sounding TF
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(220),
+                      &WifiOfdmaExample::ApSr2SiSoundingTf, this);
 
-  // Next: AP -> Sensing Reporting Trigger (stand-in)
-  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(420), [this]() {
-    NS_LOG_INFO("  AP  -> [Sensing Reporting TF] (stand-in)");
-  });
+  // t0 + ... +320us: AP -> DL NDP
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(320),
+                      &WifiOfdmaExample::ApDlNdp, this);
 
-  // Finally: STA -> Sensing Measurement Report (UDP payload with compact bf-like container)
-  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(540), [=]() {
-    const uint8_t bwCode   = (m_channelWidth == 20 ? 0 :
-                             (m_channelWidth == 40 ? 1 :
-                             (m_channelWidth == 80 ? 2 :
-                             (m_channelWidth == 160 ? 3 : 4))));
-    const uint8_t nTx = 1, nRx = 1;       // Track A: simple single-chain stub
-    const uint16_t aid12 = static_cast<uint16_t>(ex.responders.front() & 0x0FFF);
-
-    SendSensingReport(staNode, apIp, m_sensingReportPort,
-                      ex.sessionId, ex.exchangeId, aid12);
-  });
+  // t0 + ... +420us: AP -> Sensing Reporting TF
+  Simulator::Schedule(m_sensSifs + m_sensGap + MicroSeconds(420),
+                      &WifiOfdmaExample::ApSensingReportingTf, this);
 }
+
+void
+WifiOfdmaExample::StaUlTbNdp(Ptr<Node> staNode)
+{
+  NS_LOG_INFO("  STA -> [UL TB NDP] (stand-in, zero payload)");
+}
+
+void
+WifiOfdmaExample::ApSensingNdpAnnouncement()
+{
+  NS_LOG_INFO("  AP  -> [Sensing NDP Announcement] (stand-in)");
+}
+
+void
+WifiOfdmaExample::ApSr2SiSoundingTf()
+{
+  NS_LOG_INFO("  AP  -> [SR2SI Sounding TF] (stand-in)");
+}
+
+void
+WifiOfdmaExample::ApDlNdp()
+{
+  NS_LOG_INFO("  AP  -> [DL NDP] (stand-in)");
+}
+
+void
+WifiOfdmaExample::ApSensingReportingTf()
+{
+  NS_LOG_INFO("  AP  -> [Sensing Reporting TF] (stand-in)");
+}
+
+
+
+
 
 #include "ns3/udp-socket-factory.h"
 #include "ns3/inet-socket-address.h"
@@ -2328,9 +2324,9 @@ WifiOfdmaExample::SendSensingReport(Ptr<Node> staNode,
   const uint8_t nTx = 1, nRx = 1;
   const int8_t  rssiDbm = -50; // toy value for plumbing
 
-  Ptr<Packet> pkt = SensingReportBuilder::Build(sessionId, exchangeId, bwCode,
-                                                nTx, nRx, staAidOrUsid,
-                                                static_cast<uint8_t>(-rssiDbm));
+  // Ptr<Packet> pkt = SensingReportBuilder::Build(sessionId, exchangeId, bwCode,
+  //                                               nTx, nRx, staAidOrUsid,
+  //                                               static_cast<uint8_t>(-rssiDbm));
   Ptr<Packet> pkt = SensingReportBuilder::Build(sessionId, exchangeId, bwCode,
                                                 nTx, nRx, staAidOrUsid,
                                                 static_cast<uint8_t>(rssiDbm));
@@ -2429,28 +2425,28 @@ void WifiOfdmaExample::ReceiveNdpFromSta(Mac48Address apMac, Mac48Address staMac
 
 
 void WifiOfdmaExample::PauseCommsForWindow(Time start, Time dur) {
-  // Lambda to pause communications
-  auto pause = [this, dur]() {
-    for (auto &app : m_clientApps) {
-      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
-      if (!onoff) continue;
-      onoff->SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-      std::stringstream ss; ss << "ns3::ConstantRandomVariable[Constant=" << dur.GetSeconds() + 1e-3 << "]";
-      onoff->SetAttribute("OffTime", StringValue(ss.str()));
-    }
-  };
-  // Lambda to resume communications
-  auto resume = [this]() {
-    for (auto &app : m_clientApps) {
-      Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
-      if (!onoff) continue;
-      std::stringstream on; on << "ns3::ConstantRandomVariable[Constant=" << (m_warmup + m_simulationTime) << "]";
-      onoff->SetAttribute("OnTime", StringValue(on.str()));
-      onoff->SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    }
-  };
-  Simulator::Schedule(start - Simulator::Now(), pause);
-  Simulator::Schedule(start + dur - Simulator::Now(), resume);
+  // // Lambda to pause communications
+  // auto pause = [this, dur]() {
+  //   for (auto &app : m_clientApps) {
+  //     Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
+  //     if (!onoff) continue;
+  //     onoff->SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+  //     std::stringstream ss; ss << "ns3::ConstantRandomVariable[Constant=" << dur.GetSeconds() + 1e-3 << "]";
+  //     onoff->SetAttribute("OffTime", StringValue(ss.str()));
+  //   }
+  // };
+  // // Lambda to resume communications
+  // auto resume = [this]() {
+  //   for (auto &app : m_clientApps) {
+  //     Ptr<OnOffApplication> onoff = DynamicCast<OnOffApplication>(app);
+  //     if (!onoff) continue;
+  //     std::stringstream on; on << "ns3::ConstantRandomVariable[Constant=" << (m_warmup + m_simulationTime) << "]";
+  //     onoff->SetAttribute("OnTime", StringValue(on.str()));
+  //     onoff->SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
+  //   }
+  // };
+  // Simulator::Schedule(start - Simulator::Now(), pause);
+  // Simulator::Schedule(start + dur - Simulator::Now(), resume);
 }
 
 
